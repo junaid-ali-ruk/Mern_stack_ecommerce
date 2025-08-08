@@ -1,83 +1,230 @@
-import Order from "../models/Order.js";
-import User from "../models/User.js";
+const orderService = require('../services/orderService');
+const { validationResult } = require('express-validator');
 
-export const placeOrder = async (req, res) => {
+exports.createOrder = async (req, res) => {
   try {
-    const { shippingInfo } = req.body;
-    const user = await User.findById(req.user.id).populate("cart.productId");
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
 
-    if (!user.cart.length) return res.status(400).json({ message: "Cart is empty" });
+    const orderData = {
+      ...req.body,
+      userId: req.userId,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      deviceType: req.device?.type
+    };
 
-    const items = user.cart.map(item => ({
-      productId: item.productId._id,
-      quantity: item.quantity
-    }));
+    const order = await orderService.createOrder(orderData);
 
-    const totalAmount = user.cart.reduce((acc, item) => acc + item.productId.price * item.quantity, 0);
-
-    const order = new Order({
-      user: user._id,
-      items,
-      shippingInfo,
-      totalAmount
+    res.status(201).json({
+      success: true,
+      order,
+      message: 'Order created successfully'
     });
-
-    await order.save();
-
-    user.cart = [];
-    await user.save();
-
-    res.status(201).json({ message: "Order placed", order });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
   }
 };
-export const createOrder = async (req, res) => {
+
+exports.getOrder = async (req, res) => {
   try {
-    const { items, totalAmount, address, paymentMethod } = req.body;
-    const order = new Order({
-      userId: req.user.id,
-      items,
-      totalAmount,
-      address,
-      paymentMethod
+    const { orderId } = req.params;
+    
+    const order = await orderService.getOrder(orderId, req.userId);
+
+    res.json({
+      success: true,
+      order
     });
-    await order.save();
-    res.status(201).json(order);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-};
-export const getUserOrders = async (req, res) => {
-  try {
-    const orders = await Order.find({ user: req.user.id }).sort({ createdAt: -1 });
-    res.json(orders);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+  } catch (error) {
+    res.status(404).json({ message: error.message });
   }
 };
 
-
-export const getAllOrders = async (req, res) => {
+exports.getUserOrders = async (req, res) => {
   try {
-    const orders = await Order.find().populate("user", "name email").sort({ createdAt: -1 });
-    res.json(orders);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+    const result = await orderService.getUserOrders(req.userId, req.query);
+
+    res.json({
+      success: true,
+      ...result
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-export const updateOrderStatus = async (req, res) => {
+exports.updateOrderStatus = async (req, res) => {
   try {
-    const { status } = req.body;
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ message: "Order not found" });
+    const { orderId } = req.params;
+    const { status, note } = req.body;
 
-    order.status = status;
-    await order.save();
+    const order = await orderService.updateOrderStatus(
+      orderId,
+      status,
+      req.userId,
+      note
+    );
 
-    res.json({ message: "Order status updated", order });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+    res.json({
+      success: true,
+      order,
+      message: 'Order status updated successfully'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.cancelOrder = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { reason } = req.body;
+
+    const order = await orderService.cancelOrder(
+      orderId,
+      req.userId,
+      reason
+    );
+
+    res.json({
+      success: true,
+      order,
+      message: 'Order cancelled successfully'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.requestRefund = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const refundData = req.body;
+
+    const refund = await orderService.requestRefund(
+      orderId,
+      req.userId,
+      refundData
+    );
+
+    res.json({
+      success: true,
+      refund,
+      message: 'Refund request submitted successfully'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.processRefund = async (req, res) => {
+  try {
+    const { orderId, refundId } = req.params;
+    const { approved, notes } = req.body;
+
+    const refund = await orderService.processRefund(
+      orderId,
+      refundId,
+      approved,
+      req.userId,
+      notes
+    );
+
+    res.json({
+      success: true,
+      refund,
+      message: `Refund ${approved ? 'approved' : 'rejected'} successfully`
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.generateInvoice = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    const invoiceUrl = await orderService.generateInvoice(orderId);
+
+    res.json({
+      success: true,
+      invoiceUrl,
+      message: 'Invoice generated successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.downloadInvoice = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    
+    const order = await orderService.getOrder(orderId, req.userId);
+    
+    if (!order.invoice?.url) {
+      await orderService.generateInvoice(orderId);
+    }
+    
+    res.redirect(order.invoice.url);
+  } catch (error) {
+    res.status(404).json({ message: error.message });
+  }
+};
+
+exports.getOrderStats = async (req, res) => {
+  try {
+    const Order = require('../models/Order');
+    const stats = await Order.getOrderStats(req.userId, req.query.period);
+
+    res.json({
+      success: true,
+      stats
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getOrderAnalytics = async (req, res) => {
+  try {
+    const analytics = await orderService.getOrderAnalytics(req.query);
+
+    res.json({
+      success: true,
+      analytics
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.trackOrder = async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    
+    const Order = require('../models/Order');
+    const order = await Order.findOne({ orderNumber })
+      .select('orderNumber status statusHistory fulfillment createdAt');
+    
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    res.json({
+      success: true,
+      tracking: {
+        orderNumber: order.orderNumber,
+        currentStatus: order.status,
+        statusHistory: order.statusHistory,
+        fulfillment: order.fulfillment,
+        orderDate: order.createdAt
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };

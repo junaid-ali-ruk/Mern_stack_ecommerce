@@ -1,136 +1,239 @@
-// File: backend/controllers/wishlistController.js
+const Wishlist = require('../models/Wishlist');
+const { validationResult } = require('express-validator');
 
-import User from "../models/User.js";
-import Wishlist from "../models/Wishlist.js";
-
-// Get user's wishlist
-export const getWishlist = async (req, res) => {
+exports.getWishlist = async (req, res) => {
   try {
-    // Try to get from separate Wishlist model first
-    let wishlist = await Wishlist.findOne({ userId: req.user.id }).populate("products");
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const wishlist = await Wishlist.getDefaultWishlist(req.userId);
     
+    await wishlist.populate({
+      path: 'items.product',
+      select: 'name slug images basePrice comparePrice stock status rating'
+    });
+
+    const priceChanges = await wishlist.checkPriceChanges();
+
+    res.json({
+      success: true,
+      wishlist,
+      priceChanges
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.addToWishlist = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { productId, variantId } = req.body;
+
+    const wishlist = await Wishlist.getDefaultWishlist(req.userId);
+    await wishlist.addItem(productId, variantId);
+
+    await wishlist.populate({
+      path: 'items.product',
+      select: 'name slug images basePrice comparePrice'
+    });
+
+    res.json({
+      success: true,
+      wishlist,
+      message: 'Product added to wishlist'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.removeFromWishlist = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const { itemId } = req.params;
+
+    const wishlist = await Wishlist.getDefaultWishlist(req.userId);
+    await wishlist.removeItem(itemId);
+
+    res.json({
+      success: true,
+      wishlist,
+      message: 'Item removed from wishlist'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.moveToCart = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const { itemId } = req.params;
+
+    const Cart = require('../models/Cart');
+    const cart = await Cart.findOrCreate({ userId: req.userId });
+    
+    const wishlist = await Wishlist.getDefaultWishlist(req.userId);
+    const result = await wishlist.moveToCart(itemId, cart._id);
+
+    res.json({
+      success: true,
+      cart: result.cart,
+      wishlist: result.wishlist,
+      message: 'Item moved to cart'
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.createWishlist = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const { name, visibility, tags, occasion, targetDate } = req.body;
+
+    const wishlist = await Wishlist.create({
+      user: req.userId,
+      name,
+      visibility,
+      tags,
+      occasion,
+      targetDate
+    });
+
+    res.status(201).json({
+      success: true,
+      wishlist
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getUserWishlists = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const wishlists = await Wishlist.find({ user: req.userId })
+      .select('name items visibility occasion targetDate isDefault createdAt')
+      .sort('-isDefault -createdAt');
+
+    res.json({
+      success: true,
+      wishlists
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.updateWishlist = async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const { wishlistId } = req.params;
+    const updates = req.body;
+
+    const wishlist = await Wishlist.findOneAndUpdate(
+      { _id: wishlistId, user: req.userId },
+      updates,
+      { new: true, runValidators: true }
+    );
+
     if (!wishlist) {
-      // If no separate wishlist, get from user model
-      const user = await User.findById(req.user.id).populate("wishlist");
-      wishlist = {
-        products: user?.wishlist || []
-      };
+      return res.status(404).json({ message: 'Wishlist not found' });
     }
 
-    res.json(wishlist);
-  } catch (err) {
-    console.error('Get wishlist error:', err);
-    res.status(500).json({ message: err.message });
+    res.json({
+      success: true,
+      wishlist
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-// Add item to wishlist
-export const addToWishlist = async (req, res) => {
+exports.deleteWishlist = async (req, res) => {
   try {
-    const { productId } = req.body;
-    
-    if (!productId) {
-      return res.status(400).json({ message: "Product ID is required" });
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
     }
 
-    // Try to use separate Wishlist model first
-    let wishlist = await Wishlist.findOne({ userId: req.user.id });
-    
-    if (wishlist) {
-      // Check if product is already in wishlist
-      if (!wishlist.products.includes(productId)) {
-        wishlist.products.push(productId);
-        await wishlist.save();
-      }
-    } else {
-      // Create new wishlist
-      wishlist = new Wishlist({
-        userId: req.user.id,
-        products: [productId]
+    const { wishlistId } = req.params;
+
+    const wishlist = await Wishlist.findOneAndDelete({
+      _id: wishlistId,
+      user: req.userId,
+      isDefault: false
+    });
+
+    if (!wishlist) {
+      return res.status(404).json({ 
+        message: 'Wishlist not found or cannot delete default wishlist' 
       });
-      await wishlist.save();
     }
 
-    // Also update user model for backward compatibility
-    const user = await User.findById(req.user.id);
-    if (user && !user.wishlist.includes(productId)) {
-      user.wishlist.push(productId);
-      await user.save();
-    }
-
-    // Return updated wishlist
-    const updatedWishlist = await Wishlist.findOne({ userId: req.user.id }).populate("products");
-    res.json(updatedWishlist);
-    
-  } catch (err) {
-    console.error('Add to wishlist error:', err);
-    res.status(500).json({ message: err.message });
+    res.json({
+      success: true,
+      message: 'Wishlist deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-// Remove item from wishlist
-export const removeFromWishlist = async (req, res) => {
+exports.setPriceAlert = async (req, res) => {
   try {
-    const { productId } = req.body;
-    
-    if (!productId) {
-      return res.status(400).json({ message: "Product ID is required" });
+    if (!req.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
     }
 
-    // Remove from separate Wishlist model
-    const wishlist = await Wishlist.findOne({ userId: req.user.id });
-    if (wishlist) {
-      wishlist.products = wishlist.products.filter(id => !id.equals(productId));
-      await wishlist.save();
+    const { itemId } = req.params;
+    const { targetPrice, enabled = true } = req.body;
+
+    const wishlist = await Wishlist.getDefaultWishlist(req.userId);
+    const item = wishlist.items.id(itemId);
+
+    if (!item) {
+      return res.status(404).json({ message: 'Item not found' });
     }
 
-    // Also remove from user model for backward compatibility
-    const user = await User.findById(req.user.id);
-    if (user) {
-      user.wishlist = user.wishlist.filter(id => !id.equals(productId));
-      await user.save();
-    }
+    item.priceAlert = {
+      enabled,
+      targetPrice,
+      lastNotified: null
+    };
 
-    // Return updated wishlist
-    const updatedWishlist = await Wishlist.findOne({ userId: req.user.id }).populate("products");
-    res.json(updatedWishlist || { products: [] });
-    
-  } catch (err) {
-    console.error('Remove from wishlist error:', err);
-    res.status(500).json({ message: err.message });
-  }
-};
+    await wishlist.save();
 
-// Legacy functions for backward compatibility (these were duplicated in the original file)
-export const addToCart = async (req, res) => {
-  try {
-    const { productId, quantity } = req.body;
-    const user = await User.findById(req.user.id);
-
-    const existingItem = user.cart.find(item => item.productId.equals(productId));
-    if (existingItem) {
-      existingItem.quantity += quantity || 1;
-    } else {
-      user.cart.push({ productId, quantity: quantity || 1 });
-    }
-
-    await user.save();
-    res.json(user.cart);
-  } catch (err) {
-    console.error('Add to cart error:', err);
-    res.status(500).json({ message: err.message });
-  }
-};
-
-export const removeFromCart = async (req, res) => {
-  try {
-    const { productId } = req.body;
-    const user = await User.findById(req.user.id);
-    user.cart = user.cart.filter(item => !item.productId.equals(productId));
-    await user.save();
-    res.json(user.cart);
-  } catch (err) {
-    console.error('Remove from cart error:', err);
-    res.status(500).json({ message: err.message });
+    res.json({
+      success: true,
+      message: 'Price alert set successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };

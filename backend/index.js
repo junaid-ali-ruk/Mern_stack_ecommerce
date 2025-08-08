@@ -1,264 +1,193 @@
-import dotenv from "dotenv";
-dotenv.config();
+// Merged Express App with Monitoring, Queues, Analytics, Stripe, and Jobs
 
-import express from "express";
-import mongoose from "mongoose";
-import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import cookieParser from "cookie-parser";
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cookieParser = require('cookie-parser');
+const session = require('express-session');
+const MongoStore = require('connect-mongo');
+const http = require('http');
+const path = require('path');
+const cors = require('cors');
+const Bull = require('bull');
+const cron = require('node-cron');
+const statusMonitor = require('express-status-monitor');
 
-import authRoutes from "./routes/auth.js";
-import cartRoutes from "./routes/cart.js";
-import wishlistRoutes from "./routes/wishlist.js";
-import orderRoutes from "./routes/order.js";
-import paymentRoutes from "./routes/payment.js";
-import productRoutes from "./routes/product.js";
-import oauthRoutes from "./routes/oauth.js";
-
-try {
-  await import("./config/passport.js");
-  console.log('✅ Passport configuration loaded');
-} catch (error) {
-  console.error('⚠️  Error loading passport configuration:', error.message);
-}
+const socketService = require('./services/socketService');
+const monitoringService = require('./services/monitoringService');
+const analyticsService = require('./services/analyticsService');
+const { updateProductPrices, processAutoReplenish } = require('./jobs/priceUpdateJob');
+const { cleanupCarts } = require('./jobs/cartCleanup');
+const { sessionMiddleware } = require('./middleware/session');
+const { updateCachedRates } = require('./services/currencyService');
+const {
+  securityHeaders,
+  sanitizeInput,
+  checkSuspiciousActivity,
+  mongoSanitize,
+  hpp,
+  httpsRedirect
+} = require('./middleware/security');
+const {
+  compressionMiddleware,
+  responseTimeMiddleware
+} = require('./middleware/performance');
 
 const app = express();
+const server = http.createServer(app);
 
-app.set("trust proxy", true);
+app.set('trust proxy', 1);
 
-app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || 'http://localhost:3000',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-csrf-token']
-}));
-
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: "Too many requests from this IP, please try again later.",
-  standardHeaders: true,
-  legacyHeaders: false
+// Stripe raw body handler
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/webhooks/stripe') {
+    req.rawBody = req.body;
+  }
+  next();
 });
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: "Too many authentication attempts, please try again later.",
-  skipSuccessfulRequests: true
-});
-
-app.use("/api/auth", authLimiter);
-app.use(limiter);
-
+// Middleware
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
+app.use(securityHeaders);
+app.use(httpsRedirect);
+app.use(compressionMiddleware);
+app.use(responseTimeMiddleware);
+app.use(mongoSanitize());
+app.use(hpp());
+app.use(sanitizeInput);
+app.use(statusMonitor({
+  title: 'E-Commerce API Status',
+  path: '/status',
+  spans: [{ interval: 1, retention: 60 }, { interval: 5, retention: 60 }, { interval: 15, retention: 60 }],
+  chartVisibility: {
+    cpu: true, mem: true, load: true, responseTime: true, rps: true, statusCodes: true
+  },
+  healthChecks: [{ protocol: 'http', host: 'localhost', path: '/api/health', port: process.env.PORT || 5000 }]
+}));
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ 
-    status: "OK", 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    services: {
-      database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-      oauth: {
-        google: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
-        github: !!(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET)
-      },
-      email: !!process.env.RESEND_API_KEY,
-      payment: !!process.env.STRIPE_SECRET_KEY
+// Database
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => console.log('MongoDB connected'))
+  .catch(err => { console.error('DB error:', err); process.exit(1); });
+
+// Sessions
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI, touchAfter: 24 * 3600 }),
+  cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true, maxAge: 30 * 86400000, sameSite: 'strict' }
+}));
+app.use(sessionMiddleware);
+
+// Suspicious Activity Check
+app.use(checkSuspiciousActivity);
+
+// Routes
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api', require('./routes/productRoutes'));
+app.use('/api', require('./routes/cartRoutes'));
+app.use('/api', require('./routes/enhancedCartRoutes'));
+app.use('/api', require('./routes/orderRoutes'));
+app.use('/api', require('./routes/enhancedOrderRoutes'));
+app.use('/api', require('./routes/paymentExtendedRoutes'));
+app.use('/api', require('./routes/advancedRoutes'));
+app.use('/api/monitoring', require('./routes/monitoringRoutes'));
+
+// Static
+app.use('/uploads', express.static('uploads'));
+app.use('/invoices', express.static(path.join(__dirname, 'uploads/invoices')));
+
+// Socket.IO
+socketService.initialize(server);
+
+// Error handler
+app.use(async (err, req, res, next) => {
+  await monitoringService.logError(err, {
+    endpoint: req.originalUrl,
+    userId: req.userId,
+    method: req.method
+  });
+  const statusCode = err.statusCode || 500;
+  res.status(statusCode).json({
+    error: process.env.NODE_ENV === 'production' ? 'Something went wrong!' : err.message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+  });
+});
+
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not Found', message: `Cannot ${req.method} ${req.originalUrl}` });
+});
+
+// Queues
+const paymentRetryQueue = new Bull('payment-retry', {
+  redis: { host: process.env.REDIS_HOST || 'localhost', port: process.env.REDIS_PORT || 6379 }
+});
+
+paymentRetryQueue.process(async (job) => {
+  const { transactionId } = job.data;
+  const paymentServiceExtended = require('./services/paymentServiceExtended');
+  try {
+    await paymentServiceExtended.retryFailedPayment(transactionId);
+    return { success: true };
+  } catch (error) {
+    throw error;
+  }
+});
+
+// Cron Jobs
+cron.schedule('0 * * * *', cleanupCarts);
+cron.schedule('0 1 * * *', analyticsService.calculateDailyKPIs);
+cron.schedule('*/5 * * * *', monitoringService.collectSystemHealth);
+cron.schedule('0 0 * * 0', async () => {
+  const Monitoring = require('./models/Monitoring');
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+  await Monitoring.updateMany({}, {
+    $pull: {
+      apiLogs: { timestamp: { $lt: oneMonthAgo } },
+      errorLogs: { timestamp: { $lt: oneMonthAgo }, resolved: true }
     }
   });
 });
 
-const connectDB = async () => {
-  try {
-    const conn = await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      bufferMaxEntries: 0,
-      bufferCommands: false,
-    });
-
-    console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
-
-    mongoose.connection.on('error', (err) => {
-      console.error('❌ MongoDB connection error:', err);
-    });
-
-    mongoose.connection.on('disconnected', () => {
-      console.warn('⚠️ MongoDB disconnected');
-    });
-
-    mongoose.connection.on('reconnected', () => {
-      console.log('🔄 MongoDB reconnected');
-    });
-
-  } catch (error) {
-    console.error('❌ MongoDB connection failed:', error);
-    process.exit(1);
-  }
-};
-
-connectDB();
-
-try {
-  app.use("/api/auth", authRoutes);
-  app.use("/api/oauth", oauthRoutes);
-  app.use("/api/products", productRoutes);
-  app.use("/api/cart", cartRoutes);
-  app.use("/api/wishlist", wishlistRoutes);
-  app.use("/api/orders", orderRoutes);
-  app.use("/api/payment", paymentRoutes);
-  app.use("/api/user", cartRoutes);
-
-  console.log('✅ All routes mounted successfully');
-} catch (error) {
-  console.error('❌ Error mounting routes:', error);
+if (process.env.NODE_ENV === 'production') {
+  updateProductPrices();
+  processAutoReplenish();
+  setInterval(updateCachedRates, 6 * 60 * 60 * 1000);
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    message: "🚀 E-commerce API is running...",
-    version: "1.0.0",
-    endpoints: {
-      health: "/health",
-      auth: "/api/auth",
-      oauth: "/api/oauth",
-      products: "/api/products",
-      cart: "/api/cart",
-      wishlist: "/api/wishlist",
-      orders: "/api/orders",
-      payment: "/api/payment"
-    },
-    documentation: {
-      postman: "Import collection from /docs/postman.json",
-      swagger: "Visit /docs for API documentation"
-    }
-  });
-});
-
-app.use("*", (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: "Route not found",
-    path: req.originalUrl,
-    method: req.method,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Global error handler:', {
-    error: err.message,
-    stack: err.stack,
-    url: req.originalUrl,
-    method: req.method,
-    timestamp: new Date().toISOString()
-  });
-
-  if (err.name === 'ValidationError') {
-    const errors = Object.values(err.errors).map(e => e.message);
-    return res.status(400).json({
-      success: false,
-      message: "Validation Error",
-      errors
-    });
-  }
-
-  if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    return res.status(400).json({
-      success: false,
-      message: `${field} already exists`
-    });
-  }
-
-  if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid token"
-    });
-  }
-
-  if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({
-      success: false,
-      message: "Token expired"
-    });
-  }
-
-  if (err.name === 'CastError') {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid ID format"
-    });
-  }
-
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || "Internal server error",
-    ...(process.env.NODE_ENV === 'development' && { 
-      stack: err.stack,
-      details: err
-    })
-  });
-});
-
-const gracefulShutdown = async () => {
-  console.log('Shutting down gracefully...');
-  try {
-    await mongoose.connection.close();
-    console.log('MongoDB connection closed');
-    process.exit(0);
-  } catch (error) {
-    console.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-};
-
+// Graceful Shutdown
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
+async function gracefulShutdown() {
+  console.log('Shutting down...');
+  server.close(() => console.log('HTTP server closed'));
+  await mongoose.connection.close();
+  console.log('MongoDB disconnected');
+  process.exit(0);
+}
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+// Global Error Handling
+process.on('unhandledRejection', async (err) => {
+  console.error('Unhandled Rejection:', err);
+  await monitoringService.logError(err, { type: 'unhandledRejection' });
 });
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
+process.on('uncaughtException', async (err) => {
+  console.error('Uncaught Exception:', err);
+  await monitoringService.logError(err, { type: 'uncaughtException' });
   process.exit(1);
 });
 
 const PORT = process.env.PORT || 5000;
-
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🌐 CORS enabled for: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
-  console.log(`📚 API Documentation: http://localhost:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV}`);
+  console.log(`Status Monitor: http://localhost:${PORT}/status`);
 });
-
-server.on('error', (error) => {
-  if (error.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} is already in use`);
-  } else {
-    console.error('❌ Server error:', error);
-  }
-  process.exit(1);
-});
-
-export default app;

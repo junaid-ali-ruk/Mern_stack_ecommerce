@@ -1,361 +1,276 @@
-import dotenv from "dotenv";
-dotenv.config();
-import User from "../models/User.js";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import LoginHistory from "../models/LoginHistory.js";
-import { Resend } from "resend";
-import { getLoginDetails } from "../utils/userInfo.js";
+const User = require('../models/User');
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const rolePermissions = {
+  admin: {
+    products: ['create', 'read', 'update', 'delete'],
+    orders: ['create', 'read', 'update', 'delete'],
+    users: ['create', 'read', 'update', 'delete'],
+    analytics: ['read'],
+    settings: ['read', 'update']
+  },
+  manager: {
+    products: ['create', 'read', 'update'],
+    orders: ['read', 'update'],
+    users: ['read'],
+    analytics: ['read'],
+    settings: ['read']
+  },
+  user: {
+    products: ['read'],
+    orders: ['create', 'read'],
+    users: ['read:own', 'update:own'],
+    analytics: [],
+    settings: []
+  }
+};
 
-// ------------------ VERIFY LOGIN CODE ------------------
-export const verifyLoginCode = async (req, res) => {
+exports.checkPermission = (resource, action) => {
+  return async (req, res, next) => {
+    try {
+      const user = await User.findById(req.userId);
+      
+      if (!user) {
+        return res.status(401).json({ message: 'User not found' });
+      }
+
+      const userPermissions = rolePermissions[user.role];
+      
+      if (!userPermissions || !userPermissions[resource]) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+
+      const allowedActions = userPermissions[resource];
+      
+      if (action.includes(':own')) {
+        const baseAction = action.split(':')[0];
+        if (allowedActions.includes(action) || allowedActions.includes(baseAction)) {
+          req.ownershipRequired = true;
+          return next();
+        }
+      } else if (allowedActions.includes(action)) {
+        return next();
+      }
+
+      res.status(403).json({ message: 'Insufficient permissions' });
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  };
+};
+
+exports.checkOwnership = (getResourceOwnerId) => {
+  return async (req, res, next) => {
+    if (!req.ownershipRequired) {
+      return next();
+    }
+
+    try {
+      const ownerId = await getResourceOwnerId(req);
+      
+      if (ownerId.toString() !== req.userId.toString()) {
+        return res.status(403).json({ message: 'Access denied: not owner' });
+      }
+
+      next();
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  };
+};
+
+ 
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { validationResult } = require('express-validator');
+const emailService = require('../services/emailService');
+
+const generateTokens = (userId) => {
+  const accessToken = jwt.sign(
+    { userId },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+  
+  const refreshToken = jwt.sign(
+    { userId },
+    process.env.JWT_REFRESH_SECRET,
+    { expiresIn: '7d' }
+  );
+  
+  return { accessToken, refreshToken };
+};
+
+exports.register = async (req, res) => {
   try {
-    const { email, code } = req.body;
-
-    // Input validation
-    if (!email || !code) {
-      return res.status(400).json({ message: "Email and code are required" });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    const user = await User.findOne({ email });
-
-    if (!user) {
-      return res.status(400).json({ message: "User not found" });
+    const { email, password } = req.body;
+    
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(409).json({ message: 'Email already registered' });
     }
 
-    // Convert both to strings for comparison and trim whitespace
-    const userCode = String(user.loginVerificationCode || '').trim();
-    const providedCode = String(code).trim();
+    const emailVerificationToken = crypto.randomBytes(32).toString('hex');
+    const emailVerificationExpires = Date.now() + 3600000;
 
-    console.log('Stored code:', userCode);
-    console.log('Provided code:', providedCode);
-    console.log('Expiry time:', user.loginVerificationExpires);
-    console.log('Current time:', new Date());
+    const user = await User.create({
+      email,
+      password,
+      emailVerificationToken,
+      emailVerificationExpires
+    });
 
-    if (!userCode || userCode !== providedCode) {
-      return res.status(400).json({ message: "Invalid verification code" });
-    }
+    await emailService.sendVerificationEmail(email, emailVerificationToken);
 
-    if (!user.loginVerificationExpires || new Date() > user.loginVerificationExpires) {
-      return res.status(400).json({ message: "Verification code has expired" });
-    }
-
-    // Clear login code
-    user.loginVerificationCode = undefined;
-    user.loginVerificationExpires = undefined;
+    const { accessToken, refreshToken } = generateTokens(user._id);
+    
+    user.refreshToken = refreshToken;
+    user.refreshTokenExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await user.save();
 
-    // Create token
-    const token = jwt.sign(
-      { id: user._id, role: user.role }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: "1d" }
-    );
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
 
-    res.json({ 
-      token, 
-      user: { 
-        id: user._id, 
-        name: user.name,
+    res.status(201).json({
+      accessToken,
+      user: {
+        id: user._id,
         email: user.email,
         role: user.role
-      } 
+      }
     });
-
-  } catch (err) {
-    console.error('Login verification error:', err);
-    res.status(500).json({ message: "Internal server error" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-export const register = async (req, res) => {
+exports.login = async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-
-    // Input validation
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: "All fields are required" });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    // Email format validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: "Invalid email format" });
-    }
-
-    // Password strength validation
-    if (password.length < 6) {
-      return res.status(400).json({ message: "Password must be at least 6 characters long" });
-    }
-
-    const userExists = await User.findOne({ email: email.toLowerCase() });
-    if (userExists) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 12);
-
-    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
-
-    const user = new User({
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
-      password: hashedPassword,
-      isVerified: false,
-      verificationCode,
-      verificationCodeExpires: codeExpires,
-    });
-
-    await user.save();
-
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: "10m",
-    });
-
-    const htmlContent = `
-      <div style="max-width:600px;margin:auto;padding:30px;background:#f9f9f9;border-radius:10px;font-family:'Segoe UI',sans-serif;">
-        <h2 style="text-align:center;color:#4A90E2;">🚀 Welcome to Our Platform</h2>
-        <p>Hi <strong>${name}</strong>,<br/>Thanks for signing up! Please verify your email address to get started.</p>
-        <div style="text-align:center;margin:30px 0;">
-          <div style="font-size:32px;color:#4A90E2;font-weight:bold;background:#fff;padding:20px;border-radius:8px;letter-spacing:3px;">${verificationCode}</div>
-        </div>
-        <p style="text-align:center;">Or click the button below:</p>
-        <a href="${process.env.BASE_URL || 'http://localhost:5000'}/api/auth/verify-email/${token}" 
-           style="display:block;text-align:center;margin-top:20px;padding:12px 24px;background:#4A90E2;color:#fff;text-decoration:none;border-radius:5px;">
-          Verify Email Address
-        </a>
-        <p style="font-size:12px;color:#999;text-align:center;margin-top:40px;">This code will expire in 10 minutes. If you didn't sign up, please ignore this email.</p>
-      </div>
-    `;
-
-    try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'noreply@example.com',
-        to: email,
-        subject: "Verify your email",
-        html: htmlContent,
-      });
-    } catch (emailError) {
-      console.error('Email sending failed:', emailError);
-      // Don't fail registration if email fails
-    }
-
-    res.status(201).json({ 
-      message: "Registration successful. Verification email sent.",
-      userId: user._id 
-    });
-
-  } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
-export const login = async (req, res) => {
-  try {
     const { email, password } = req.body;
-
-    // Input validation
-    if (!email || !password) {
-      return res.status(400).json({ message: "Email and password are required" });
+    
+    const user = await User.findOne({ email });
+    if (!user || !(await user.comparePassword(password))) {
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user) {
-      return res.status(400).json({ message: "Invalid credentials" });
+    if (!user.isEmailVerified) {
+      return res.status(403).json({ message: 'Please verify your email first' });
     }
 
-    if (!user.isVerified) {
-      return res.status(401).json({ message: "Email not verified" });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    // Generate 6-digit code
-    const loginCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeExpires = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
-
-    user.loginVerificationCode = loginCode;
-    user.loginVerificationExpires = codeExpires;
+    const { accessToken, refreshToken } = generateTokens(user._id);
+    
+    user.refreshToken = refreshToken;
+    user.refreshTokenExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await user.save();
 
-    console.log('Generated login code:', loginCode);
-    console.log('Code expires at:', codeExpires);
-
-    const details = await getLoginDetails(req);
-
-    // Save login history
-    try {
-      await LoginHistory.create({
-        user: user._id,
-        loginTime: details.time,
-        ...details,
-      });
-    } catch (historyError) {
-      console.error('Failed to save login history:', historyError);
-    }
-
-    // Send verification code email
-    try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'noreply@example.com',
-        to: user.email,
-        subject: "🔐 Your Login Verification Code",
-        html: `
-          <div style="font-family:'Segoe UI',sans-serif;padding:30px;background:#f9f9f9;border-radius:10px;max-width:600px;margin:auto;">
-            <h2 style="color:#4A90E2;text-align:center;">🔐 Login Verification</h2>
-            <p>Hello <strong>${user.name}</strong>,</p>
-            <p>Please use the following code to verify your login:</p>
-            <div style="text-align:center;margin:30px 0;">
-              <div style="font-size:32px;color:#27AE60;font-weight:bold;background:#fff;padding:20px;border-radius:8px;letter-spacing:3px;">${loginCode}</div>
-            </div>
-            <p style="text-align:center;color:#666;">This code will expire in 30 minutes.</p>
-            <p style="font-size:12px;color:#999;margin-top:30px;">If you didn't request this code, please ignore this email and consider changing your password.</p>
-          </div>
-        `,
-      });
-    } catch (emailError) {
-      console.error('Failed to send verification email:', emailError);
-    }
-
-    // Send login alert email
-    try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'noreply@example.com',
-        to: user.email,
-        subject: "🚨 New Login Alert",
-        html: `
-          <div style="font-family:'Segoe UI',sans-serif;padding:30px;background:#fdfdfd;border-radius:10px;max-width:600px;margin:auto;">
-            <h2 style="text-align:center;color:#E74C3C;">🚨 New Login Detected</h2>
-            <p>Hello <strong>${user.name}</strong>,</p>
-            <p>We detected a new login to your account:</p>
-            <div style="background:#f8f9fa;padding:15px;border-radius:5px;margin:20px 0;">
-              <p><strong>IP Address:</strong> ${details.ip || 'Unknown'}</p>
-              <p><strong>Location:</strong> ${details.city || 'Unknown'}, ${details.country || 'Unknown'}</p>
-              <p><strong>Time:</strong> ${details.currentTime || new Date().toISOString()}</p>
-              ${details.org ? `<p><strong>Organization:</strong> ${details.org}</p>` : ''}
-            </div>
-            <p>If this wasn't you, please secure your account immediately:</p>
-            <a href="${process.env.BASE_URL || 'http://localhost:3000'}/reset-password"
-               style="display:block;text-align:center;margin-top:20px;padding:12px;background:#E74C3C;color:#fff;text-decoration:none;border-radius:5px;">
-              Reset Password
-            </a>
-          </div>
-        `,
-      });
-    } catch (alertEmailError) {
-      console.error('Failed to send login alert:', alertEmailError);
-    }
-
-    res.status(200).json({ 
-      message: "Login code sent to email for verification.",
-      email: user.email
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000
     });
 
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ message: "Internal server error" });
+    res.json({
+      accessToken,
+      user: {
+        id: user._id,
+        email: user.email,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-export const verifyEmail = async (req, res) => {
+exports.verifyEmail = async (req, res) => {
   try {
-    const { email, code } = req.body;
+    const { token } = req.params;
+    
+    const user = await User.findOne({
+      emailVerificationToken: token,
+      emailVerificationExpires: { $gt: Date.now() }
+    });
 
-    // Input validation
-    if (!email || !code) {
-      return res.status(400).json({ message: "Email and code are required" });
-    }
-
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(400).json({ message: 'Invalid or expired verification token' });
     }
 
-    if (user.isVerified) {
-      return res.status(400).json({ message: "User already verified" });
-    }
-
-    // Convert both to strings for comparison and trim whitespace
-    const userCode = String(user.verificationCode || '').trim();
-    const providedCode = String(code).trim();
-
-    if (!userCode || userCode !== providedCode) {
-      return res.status(400).json({ message: "Invalid verification code" });
-    }
-
-    if (!user.verificationCodeExpires || new Date() > user.verificationCodeExpires) {
-      return res.status(400).json({ message: "Verification code has expired" });
-    }
-
-    user.isVerified = true;
-    user.verificationCode = undefined;
-    user.verificationCodeExpires = undefined;
+    user.isEmailVerified = true;
+    user.emailVerificationToken = undefined;
+    user.emailVerificationExpires = undefined;
     await user.save();
 
-    res.json({ message: "Email verified successfully" });
-
-  } catch (err) {
-    console.error('Email verification error:', err);
-    res.status(500).json({ message: "Internal server error" });
+    res.json({ message: 'Email verified successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
-// Additional helper function to resend verification code
-export const resendLoginCode = async (req, res) => {
+exports.refreshToken = async (req, res) => {
   try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: "Email is required" });
+    const { refreshToken } = req.cookies;
+    
+    if (!refreshToken) {
+      return res.status(401).json({ message: 'No refresh token provided' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    
+    const user = await User.findOne({
+      _id: decoded.userId,
+      refreshToken,
+      refreshTokenExpires: { $gt: Date.now() }
+    });
+
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(401).json({ message: 'Invalid refresh token' });
     }
 
-    // Generate new code
-    const loginCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeExpires = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
-
-    user.loginVerificationCode = loginCode;
-    user.loginVerificationExpires = codeExpires;
+    const tokens = generateTokens(user._id);
+    
+    user.refreshToken = tokens.refreshToken;
+    user.refreshTokenExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await user.save();
 
-    // Send new code
-    try {
-      await resend.emails.send({
-        from: process.env.FROM_EMAIL || 'noreply@example.com',
-        to: user.email,
-        subject: "🔐 New Login Verification Code",
-        html: `
-          <div style="font-family:'Segoe UI',sans-serif;padding:30px;background:#f9f9f9;border-radius:10px;max-width:600px;margin:auto;">
-            <h2 style="color:#4A90E2;text-align:center;">🔐 New Login Verification Code</h2>
-            <p>Hello <strong>${user.name}</strong>,</p>
-            <p>Here's your new login verification code:</p>
-            <div style="text-align:center;margin:30px 0;">
-              <div style="font-size:32px;color:#27AE60;font-weight:bold;background:#fff;padding:20px;border-radius:8px;letter-spacing:3px;">${loginCode}</div>
-            </div>
-            <p style="text-align:center;color:#666;">This code will expire in 30 minutes.</p>
-          </div>
-        `,
-      });
+    res.cookie('refreshToken', tokens.refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
 
-      res.json({ message: "New verification code sent" });
-    } catch (emailError) {
-      console.error('Failed to send new code:', emailError);
-      res.status(500).json({ message: "Failed to send verification code" });
+    res.json({ accessToken: tokens.accessToken });
+  } catch (error) {
+    res.status(401).json({ message: 'Invalid refresh token' });
+  }
+};
+
+exports.logout = async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (user) {
+      user.refreshToken = undefined;
+      user.refreshTokenExpires = undefined;
+      await user.save();
     }
-
-  } catch (err) {
-    console.error('Resend code error:', err);
-    res.status(500).json({ message: "Internal server error" });
+    
+    res.clearCookie('refreshToken');
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
