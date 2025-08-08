@@ -62,7 +62,7 @@ if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
       },
       async (accessToken, refreshToken, profile, done) => {
         try {
-          // GitHub might not always provide email in the profile
+           
           const email = profile.emails?.[0]?.value || `${profile.username}@github.local`;
           
           // Check if user already exists with this email
