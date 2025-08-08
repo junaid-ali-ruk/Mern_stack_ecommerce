@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const { nanoid } = require('nanoid');
 
 const addressSchema = new mongoose.Schema({
   type: {
@@ -193,7 +192,7 @@ const orderSchema = new mongoose.Schema({
   payment: {
     method: {
       type: String,
-      enum: ['card', 'paypal', 'stripe', 'cod', 'bank_transfer', 'wallet'],
+      enum: ['card' , 'stripe', 'cod', 'bank_transfer', 'wallet'],
       required: true
     },
     status: {
@@ -350,7 +349,6 @@ orderSchema.methods.generateOrderNumber = async function() {
   const year = date.getFullYear().toString().slice(-2);
   const month = (date.getMonth() + 1).toString().padStart(2, '0');
   const day = date.getDate().toString().padStart(2, '0');
-  const random = nanoid(6).toUpperCase();
   
   return `ORD-${year}${month}${day}-${random}`;
 };

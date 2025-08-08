@@ -1,5 +1,5 @@
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const RedisStore = require('rate-limit-redis').default; // ✅ FIXED
 const slowDown = require('express-slow-down');
 const helmet = require('helmet');
 const mongoSanitize = require('express-mongo-sanitize');
@@ -7,6 +7,7 @@ const xss = require('xss');
 const hpp = require('hpp');
 const securityService = require('../services/securityService');
 const Redis = require('ioredis');
+const path = require('path'); // ✅ Needed for fileUploadValidator
 
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
@@ -16,7 +17,7 @@ const redis = new Redis({
 const createRateLimiter = (options = {}) => {
   return rateLimit({
     store: new RedisStore({
-      client: redis,
+      sendCommand: (...args) => redis.call(...args), // ✅ required by `rate-limit-redis`
       prefix: 'rate_limit:'
     }),
     windowMs: options.windowMs || 15 * 60 * 1000,
@@ -35,10 +36,10 @@ const createRateLimiter = (options = {}) => {
           method: req.method
         }
       });
-      
+
       res.status(429).json({
         error: 'Too many requests',
-        retryAfter: req.rateLimit.resetTime
+        retryAfter: req.rateLimit?.resetTime || null
       });
     }
   });
@@ -64,7 +65,7 @@ const strictLimiter = createRateLimiter({
 const speedLimiter = slowDown({
   windowMs: 15 * 60 * 1000,
   delayAfter: 50,
-  delayMs: 500,
+  delayMs: () => 500,
   maxDelayMs: 20000
 });
 
@@ -99,26 +100,26 @@ const sanitizeInput = (req, res, next) => {
       }
     }
   };
-  
+
   if (req.body) sanitizeObject(req.body);
   if (req.query) sanitizeObject(req.query);
   if (req.params) sanitizeObject(req.params);
-  
+
   next();
 };
 
 const checkSuspiciousActivity = async (req, res, next) => {
   const ip = securityService.getClientIP(req);
-  
+
   if (securityService.isIPBlocked(ip)) {
     return res.status(403).json({
       error: 'Access denied',
       message: 'Your IP has been blocked due to suspicious activity'
     });
   }
-  
+
   const check = await securityService.checkSuspiciousActivity(req);
-  
+
   if (check.suspicious && check.shouldBlock) {
     await securityService.blockIP(ip, 'Suspicious patterns detected');
     return res.status(403).json({
@@ -126,16 +127,16 @@ const checkSuspiciousActivity = async (req, res, next) => {
       message: 'Suspicious activity detected'
     });
   }
-  
+
   const ipTracking = await securityService.trackIPActivity(ip);
-  
+
   if (ipTracking.blocked) {
     return res.status(429).json({
       error: 'Rate limit exceeded',
       message: 'Too many requests from your IP'
     });
   }
-  
+
   next();
 };
 
@@ -153,18 +154,18 @@ const validateRequest = (schema) => {
           stripUnknown: true
         }
       );
-      
+
       req.body = validated.body;
       req.query = validated.query;
       req.params = validated.params;
-      
+
       next();
     } catch (error) {
       const errors = error.details.map(detail => ({
         field: detail.path.join('.'),
         message: detail.message
       }));
-      
+
       res.status(400).json({
         error: 'Validation failed',
         errors
@@ -175,37 +176,35 @@ const validateRequest = (schema) => {
 
 const fileUploadValidator = (options = {}) => {
   return (req, res, next) => {
-    if (!req.files || req.files.length === 0) {
-      return next();
-    }
-    
+    if (!req.files || req.files.length === 0) return next();
+
     const maxSize = options.maxSize || 5 * 1024 * 1024;
     const allowedTypes = options.allowedTypes || ['image/jpeg', 'image/png', 'image/gif'];
     const allowedExtensions = options.allowedExtensions || ['.jpg', '.jpeg', '.png', '.gif'];
-    
+
     for (const file of req.files) {
       if (file.size > maxSize) {
         return res.status(400).json({
           error: 'File too large',
-          message: `File ${file.originalname} exceeds maximum size of ${maxSize / 1024 / 1024}MB`
+          message: `File ${file.originalname} exceeds ${maxSize / 1024 / 1024}MB`
         });
       }
-      
+
       if (!allowedTypes.includes(file.mimetype)) {
         return res.status(400).json({
           error: 'Invalid file type',
           message: `File type ${file.mimetype} is not allowed`
         });
       }
-      
+
       const extension = path.extname(file.originalname).toLowerCase();
       if (!allowedExtensions.includes(extension)) {
         return res.status(400).json({
           error: 'Invalid file extension',
-          message: `File extension ${extension} is not allowed`
+          message: `Extension ${extension} is not allowed`
         });
       }
-      
+
       const fileTypeCheck = /^(image|application\/pdf|text\/csv)/.test(file.mimetype);
       if (!fileTypeCheck) {
         return res.status(400).json({
@@ -214,26 +213,24 @@ const fileUploadValidator = (options = {}) => {
         });
       }
     }
-    
+
     next();
   };
 };
 
 const csrfProtection = (req, res, next) => {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    return next();
-  }
-  
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+
   const token = req.headers['x-csrf-token'] || req.body._csrf;
   const sessionToken = req.session?.csrfToken;
-  
+
   if (!token || !sessionToken || !securityService.validateCSRFToken(token, sessionToken)) {
     return res.status(403).json({
       error: 'CSRF validation failed',
       message: 'Invalid or missing CSRF token'
     });
   }
-  
+
   next();
 };
 

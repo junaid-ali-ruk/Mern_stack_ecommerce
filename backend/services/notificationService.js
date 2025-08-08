@@ -59,12 +59,7 @@ class NotificationService {
       emailData
     );
 
-    if (order.addresses.billing.phone) {
-      await this.sendSMS(
-        order.addresses.billing.phone,
-        `Your order ${order.orderNumber} has been confirmed! Total: ${this.formatCurrency(order.pricing.total)}. Track: ${process.env.FRONTEND_URL}/track/${order.orderNumber}`
-      );
-    }
+     
   }
 
   async sendShippingUpdate(order) {
@@ -86,12 +81,7 @@ class NotificationService {
       emailData
     );
 
-    if (order.addresses.billing.phone) {
-      await this.sendSMS(
-        order.addresses.billing.phone,
-        `Your order ${order.orderNumber} has shipped! Track it here: ${order.fulfillment.trackingUrl}`
-      );
-    }
+    
   }
 
   async sendDeliveryConfirmation(order) {
@@ -157,20 +147,7 @@ class NotificationService {
     }
   }
 
-  async sendSMS(to, message) {
-    try {
-      const result = await this.twilioClient.messages.create({
-        body: message,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to
-      });
-
-      return { success: true, messageId: result.sid };
-    } catch (error) {
-      console.error('SMS send error:', error);
-      return { success: false, error: error.message };
-    }
-  }
+   
 
   async sendBulkEmails(recipients, subject, template, commonData = {}) {
     const personalizations = recipients.map(recipient => ({

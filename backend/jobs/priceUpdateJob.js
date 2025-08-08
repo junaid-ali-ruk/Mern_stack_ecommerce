@@ -1,4 +1,3 @@
-const cron = require('node-cron');
 const enhancedCartService = require('../services/enhancedCartService');
 const Product = require('../models/Product');
 const PriceHistory = require('../models/PriceHistory');
@@ -66,9 +65,7 @@ const processAutoReplenish = async () => {
   }
 };
 
-cron.schedule('0 */6 * * *', updateProductPrices);
 
-cron.schedule('0 9 * * *', processAutoReplenish);
 
 module.exports = {
   updateProductPrices,

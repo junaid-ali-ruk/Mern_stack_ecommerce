@@ -3,12 +3,12 @@ const mongoose = require('mongoose');
 const paymentMethodSchema = new mongoose.Schema({
   type: {
     type: String,
-    enum: ['card', 'bank', 'wallet', 'paypal'],
+    enum: ['card', 'bank', 'wallet',  ],
     required: true
   },
   provider: {
     type: String,
-    enum: ['stripe', 'paypal', 'razorpay', 'square'],
+    enum: ['stripe',   'razorpay', 'square'],
     required: true
   },
   tokenId: String,

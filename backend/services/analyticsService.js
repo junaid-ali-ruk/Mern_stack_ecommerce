@@ -2,8 +2,6 @@ const Analytics = require('../models/Analytics');
 const Order = require('../models/Order');
 const User = require('../models/User');
 const Product = require('../models/Product');
-const ss = require('simple-statistics');
-
 class AnalyticsService {
   async recordEvent(type, data, metadata) {
     const event = {

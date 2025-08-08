@@ -89,25 +89,7 @@ exports.handleStripeWebhook = async (req, res) => {
   }
 };
 
-exports.handlePayPalWebhook = async (req, res) => {
-  try {
-    const verification = await paymentService.verifyWebhook(
-      'paypal',
-      req.headers,
-      req.body
-    );
-
-    if (!verification.valid) {
-      return res.status(400).json({ message: 'Invalid webhook signature' });
-    }
-
-    await paymentService.handleWebhookEvent('paypal', verification.event);
-
-    res.json({ received: true });
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
-};
+ 
 
 exports.convertCurrency = async (req, res) => {
   try {

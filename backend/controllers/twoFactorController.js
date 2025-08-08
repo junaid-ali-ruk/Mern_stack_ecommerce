@@ -3,7 +3,7 @@ const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
 const crypto = require('crypto');
 const emailService = require('../services/emailService');
-const smsService = require('../services/smsService');
+ 
 
 exports.enableTwoFactor = async (req, res) => {
   try {
@@ -83,9 +83,7 @@ exports.sendTwoFactorCode = async (userId, method) => {
 
   if (method === 'email') {
     await emailService.sendTwoFactorCode(user.email, code);
-  } else if (method === 'sms' && user.phone) {
-    await smsService.sendTwoFactorCode(user.phone, code);
-  }
+  } 
 
   return true;
 };

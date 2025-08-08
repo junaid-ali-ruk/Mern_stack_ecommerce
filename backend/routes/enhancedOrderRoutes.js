@@ -82,9 +82,7 @@ router.post('/webhooks/stripe',
   paymentController.handleStripeWebhook
 );
 
-router.post('/webhooks/paypal',
-  paymentController.handlePayPalWebhook
-);
+ 
 
 router.get('/currency/convert',
   paymentController.convertCurrency

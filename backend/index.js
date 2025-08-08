@@ -10,9 +10,8 @@ const http = require('http');
 const path = require('path');
 const cors = require('cors');
 const Bull = require('bull');
-const cron = require('node-cron');
 const statusMonitor = require('express-status-monitor');
-
+ 
 const socketService = require('./services/socketService');
 const monitoringService = require('./services/monitoringService');
 const analyticsService = require('./services/analyticsService');
@@ -55,7 +54,7 @@ app.use(securityHeaders);
 app.use(httpsRedirect);
 app.use(compressionMiddleware);
 app.use(responseTimeMiddleware);
-app.use(mongoSanitize());
+app.use(mongoSanitize);
 app.use(hpp());
 app.use(sanitizeInput);
 app.use(statusMonitor({
@@ -89,6 +88,8 @@ app.use(sessionMiddleware);
 app.use(checkSuspiciousActivity);
 
 // Routes
+app.use(mongoSanitize());
+app.use(hpp());
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api', require('./routes/productRoutes'));
 app.use('/api', require('./routes/cartRoutes'));
@@ -141,21 +142,7 @@ paymentRetryQueue.process(async (job) => {
   }
 });
 
-// Cron Jobs
-cron.schedule('0 * * * *', cleanupCarts);
-cron.schedule('0 1 * * *', analyticsService.calculateDailyKPIs);
-cron.schedule('*/5 * * * *', monitoringService.collectSystemHealth);
-cron.schedule('0 0 * * 0', async () => {
-  const Monitoring = require('./models/Monitoring');
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-  await Monitoring.updateMany({}, {
-    $pull: {
-      apiLogs: { timestamp: { $lt: oneMonthAgo } },
-      errorLogs: { timestamp: { $lt: oneMonthAgo }, resolved: true }
-    }
-  });
-});
+
 
 if (process.env.NODE_ENV === 'production') {
   updateProductPrices();

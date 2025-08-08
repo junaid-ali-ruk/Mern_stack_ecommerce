@@ -73,7 +73,7 @@ const userSchema = new mongoose.Schema({
   },
   twoFactorMethod: {
     type: String,
-    enum: ['email', 'sms', 'authenticator'],
+    enum: ['email',  , 'authenticator'],
     default: 'email'
   },
   twoFactorSecret: String,

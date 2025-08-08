@@ -1,31 +1,14 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const paypal = require('@paypal/checkout-server-sdk');
 const Transaction = require('../models/Transaction');
 const Order = require('../models/Order');
 const crypto = require('crypto');
 
 class PaymentService {
   constructor() {
-    this.initializePayPal();
     this.providers = {
       stripe: this.processStripePayment.bind(this),
-      paypal: this.processPayPalPayment.bind(this),
       cod: this.processCODPayment.bind(this)
     };
-  }
-
-  initializePayPal() {
-    const environment = process.env.NODE_ENV === 'production' ?
-      new paypal.core.LiveEnvironment(
-        process.env.PAYPAL_CLIENT_ID,
-        process.env.PAYPAL_CLIENT_SECRET
-      ) :
-      new paypal.core.SandboxEnvironment(
-        process.env.PAYPAL_CLIENT_ID,
-        process.env.PAYPAL_CLIENT_SECRET
-      );
-    
-    this.paypalClient = new paypal.core.PayPalHttpClient(environment);
   }
 
   async processPayment(paymentData) {
@@ -53,9 +36,7 @@ class PaymentService {
 
     try {
       const provider = this.providers[method];
-      if (!provider) {
-        throw new Error(`Unsupported payment method: ${method}`);
-      }
+      if (!provider) throw new Error(`Unsupported payment method: ${method}`);
 
       const result = await provider(paymentData, transaction);
 
@@ -88,7 +69,6 @@ class PaymentService {
   async processStripePayment(paymentData, transaction) {
     try {
       const { amount, currency, paymentDetails } = paymentData;
-
       let paymentIntent;
 
       if (paymentDetails.paymentMethodId) {
@@ -140,58 +120,6 @@ class PaymentService {
     }
   }
 
-  async processPayPalPayment(paymentData, transaction) {
-    try {
-      const { amount, currency, paymentDetails } = paymentData;
-
-      if (paymentDetails.orderId) {
-        const request = new paypal.orders.OrdersCaptureRequest(paymentDetails.orderId);
-        request.requestBody({});
-
-        const capture = await this.paypalClient.execute(request);
-
-        if (capture.result.status === 'COMPLETED') {
-          return {
-            status: 'completed',
-            transactionId: capture.result.id,
-            paymentIntentId: capture.result.purchase_units[0].payments.captures[0].id,
-            rawResponse: capture.result
-          };
-        } else {
-          throw new Error(`Payment status: ${capture.result.status}`);
-        }
-      } else {
-        const request = new paypal.orders.OrdersCreateRequest();
-        request.prefer("return=representation");
-        request.requestBody({
-          intent: 'CAPTURE',
-          purchase_units: [{
-            amount: {
-              currency_code: currency,
-              value: amount.toFixed(2)
-            },
-            reference_id: paymentData.orderId.toString()
-          }]
-        });
-
-        const order = await this.paypalClient.execute(request);
-
-        return {
-          status: 'processing',
-          transactionId: order.result.id,
-          approvalUrl: order.result.links.find(link => link.rel === 'approve').href,
-          rawResponse: order.result
-        };
-      }
-    } catch (error) {
-      throw {
-        code: 'PAYPAL_ERROR',
-        message: error.message,
-        details: error
-      };
-    }
-  }
-
   async processCODPayment(paymentData, transaction) {
     const verificationCode = crypto.randomBytes(3).toString('hex').toUpperCase();
 
@@ -210,10 +138,7 @@ class PaymentService {
 
   async processRefund(transactionId, amount, reason) {
     const transaction = await Transaction.findById(transactionId);
-
-    if (!transaction) {
-      throw new Error('Transaction not found');
-    }
+    if (!transaction) throw new Error('Transaction not found');
 
     const refundTransaction = await Transaction.create({
       order: transaction.order,
@@ -232,11 +157,6 @@ class PaymentService {
       if (transaction.gateway.provider === 'stripe') {
         refundResult = await this.processStripeRefund(
           transaction.gateway.paymentIntentId,
-          amount
-        );
-      } else if (transaction.gateway.provider === 'paypal') {
-        refundResult = await this.processPayPalRefund(
-          transaction.gateway.captureId,
           amount
         );
       } else {
@@ -285,89 +205,21 @@ class PaymentService {
     return refund;
   }
 
-  async processPayPalRefund(captureId, amount) {
-    const request = new paypal.payments.CapturesRefundRequest(captureId);
-    request.requestBody({
-      amount: {
-        value: amount.toFixed(2),
-        currency_code: 'USD'
-      }
-    });
-
-    const refund = await this.paypalClient.execute(request);
-    return refund.result;
-  }
-
-  async verifyWebhook(provider, headers, body) {
-    if (provider === 'stripe') {
-      return this.verifyStripeWebhook(headers, body);
-    } else if (provider === 'paypal') {
-      return this.verifyPayPalWebhook(headers, body);
-    }
-
-    throw new Error('Unsupported webhook provider');
-  }
-
   verifyStripeWebhook(headers, body) {
     const signature = headers['stripe-signature'];
     const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
     try {
-      const event = stripe.webhooks.constructEvent(
-        body,
-        signature,
-        endpointSecret
-      );
-
-      return {
-        valid: true,
-        event
-      };
+      const event = stripe.webhooks.constructEvent(body, signature, endpointSecret);
+      return { valid: true, event };
     } catch (error) {
-      return {
-        valid: false,
-        error: error.message
-      };
-    }
-  }
-
-  async verifyPayPalWebhook(headers, body) {
-    const webhookId = process.env.PAYPAL_WEBHOOK_ID;
-    const transmissionId = headers['paypal-transmission-id'];
-    const transmissionSig = headers['paypal-transmission-sig'];
-    const transmissionTime = headers['paypal-transmission-time'];
-    const certUrl = headers['paypal-cert-url'];
-
-    const request = new paypal.notifications.VerifyWebhookSignatureRequest();
-    request.requestBody({
-      transmission_id: transmissionId,
-      transmission_time: transmissionTime,
-      cert_url: certUrl,
-      auth_algo: headers['paypal-auth-algo'],
-      transmission_sig: transmissionSig,
-      webhook_id: webhookId,
-      webhook_event: body
-    });
-
-    try {
-      const response = await this.paypalClient.execute(request);
-      return {
-        valid: response.result.verification_status === 'SUCCESS',
-        event: body
-      };
-    } catch (error) {
-      return {
-        valid: false,
-        error: error.message
-      };
+      return { valid: false, error: error.message };
     }
   }
 
   async handleWebhookEvent(provider, event) {
     if (provider === 'stripe') {
       return this.handleStripeWebhook(event);
-    } else if (provider === 'paypal') {
-      return this.handlePayPalWebhook(event);
     }
   }
 
@@ -384,23 +236,10 @@ class PaymentService {
     }
   }
 
-  async handlePayPalWebhook(event) {
-    const handlers = {
-      'PAYMENT.CAPTURE.COMPLETED': this.handlePaymentSuccess.bind(this),
-      'PAYMENT.CAPTURE.DENIED': this.handlePaymentFailure.bind(this),
-      'PAYMENT.CAPTURE.REFUNDED': this.handleRefundUpdate.bind(this)
-    };
-
-    const handler = handlers[event.event_type];
-    if (handler) {
-      await handler(event.resource);
-    }
-  }
-
   async handlePaymentSuccess(paymentData) {
     const transactionId = paymentData.metadata?.orderId || paymentData.reference_id;
-    
     const order = await Order.findById(transactionId);
+
     if (order) {
       order.payment.status = 'completed';
       order.payment.paidAt = new Date();
@@ -411,8 +250,8 @@ class PaymentService {
 
   async handlePaymentFailure(paymentData) {
     const transactionId = paymentData.metadata?.orderId || paymentData.reference_id;
-    
     const order = await Order.findById(transactionId);
+
     if (order) {
       order.payment.status = 'failed';
       await order.save();
@@ -427,9 +266,7 @@ class PaymentService {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency: currency.toLowerCase(),
-      automatic_payment_methods: {
-        enabled: true
-      },
+      automatic_payment_methods: { enabled: true },
       metadata
     });
 
@@ -452,7 +289,6 @@ class PaymentService {
 
   async getPaymentMethods(userId) {
     const customer = await this.getOrCreateStripeCustomer(userId);
-    
     const paymentMethods = await stripe.paymentMethods.list({
       customer: customer.id,
       type: 'card'
@@ -472,11 +308,7 @@ class PaymentService {
 
   async savePaymentMethod(userId, paymentMethodId) {
     const customer = await this.getOrCreateStripeCustomer(userId);
-    
-    await stripe.paymentMethods.attach(paymentMethodId, {
-      customer: customer.id
-    });
-
+    await stripe.paymentMethods.attach(paymentMethodId, { customer: customer.id });
     return { success: true };
   }
 
@@ -490,9 +322,7 @@ class PaymentService {
 
     const customer = await stripe.customers.create({
       email: user.email,
-      metadata: {
-        userId: userId.toString()
-      }
+      metadata: { userId: userId.toString() }
     });
 
     user.stripeCustomerId = customer.id;

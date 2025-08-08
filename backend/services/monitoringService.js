@@ -248,7 +248,7 @@ class MonitoringService {
   async checkExternalServices() {
     const services = [
       { name: 'Stripe', url: 'https://api.stripe.com', critical: true },
-      { name: 'PayPal', url: 'https://api.paypal.com', critical: true },
+      
       { name: 'SendGrid', url: 'https://api.sendgrid.com', critical: false },
       { name: 'Cloudinary', url: 'https://api.cloudinary.com', critical: false }
     ];
